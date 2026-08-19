@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+
+# Environments
+venv/
+env/
+.env
+
+# Caches & Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+
+# Editor directories and files
+.vscode/
+*.swp
+*.swo
