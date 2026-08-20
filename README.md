@@ -3,9 +3,6 @@
 A local, multi-agent paper-trading research system built with LangGraph, Ollama, and MCP — designed around one governing question: **what does it cost to reach a successful outcome, not how often does the model sound right?**
 
 This project exists to defend a specific set of engineering claims, not just to produce trade recommendations. It was rebuilt from the ground up around six non-negotiable design principles (below), each chosen because it's the kind of thing that either holds up under a hard follow-up question in an interview, or doesn't.
-
-> The system this repo implements was described this way after an earlier version of it was reviewed by a startup CTO: *"The LangGraph multi-agent system you built, with deterministic risk logic and explicit human approval gates, evaluated on cost per successful outcome rather than raw accuracy."* Everything below is built to make that sentence provably true, not just plausible.
-
 ---
 
 ## Design principles (non-negotiable)
