@@ -16,32 +16,33 @@ flowchart TD
     Watchdog["watchdog node<br/>technical_analysis<br/>pure Python, no LLM"]:::built
     Evaluator["rag_evaluator node<br/>fundamental_rag<br/>Ollama llama3.1"]:::built
     Sanitizer["xss_sanitizer node<br/>html.escape"]:::built
-    Sizing["position_sizing node<br/>NOT YET WIRED INTO GRAPH"]:::planned
-    Approval{{"Human Approval Gate<br/>LangGraph interrupt + checkpointer"}}:::planned
-    Executor["executor node<br/>paper trade only"]:::planned
+    Sizing["position_sizing node<br/>Monte Carlo risk + fractional Kelly<br/>calls quant_tools directly, no LLM"]:::built
+    Approval{{"human_approval node<br/>LangGraph interrupt + MemorySaver checkpoint"}}:::built
+    Executor["executor_stub node<br/>paper trade stub"]:::built
+    LogStop["log_and_stop node"]:::built
     Ledger[("SQLite Ledger")]:::planned
     Metrics["Cost / Outcome Metrics"]:::planned
 
-    Security -->|"is_safe = false"| RejectA(["LOG + END<br/>REJECTED"]):::reject
+    Security -->|"is_safe = false"| RejectA(["END<br/>REJECTED"]):::reject
     Security -->|"is_safe = true"| Watchdog
-    Watchdog -->|"status = ERROR"| RejectB(["LOG + END<br/>ERROR"]):::reject
+    Watchdog -->|"status = ERROR"| RejectB(["END<br/>ERROR"]):::reject
     Watchdog -->|"status = ANALYZED"| Evaluator
     Evaluator --> Sanitizer
-    Sanitizer --> End0(["END (current graph stops here)"])
-
-    Sanitizer -.->|"not yet connected"| Sizing
-    Sizing -.->|"not yet connected"| Approval
-    Approval -->|"approved"| Executor
-    Approval -->|"rejected / edited"| RejectC(["LOG + STOP"]):::reject
-    Executor --> Ledger
-    Ledger --> Metrics
-    Metrics --> End1(["END (planned)"])
-
-    Evaluator -.->|"LLM tool-call<br/>model decides"| MC[["MCP quant_tools:<br/>estimate_risk_monte_carlo"]]:::mcp
-    MC -.->|"RiskEstimate"| Evaluator
+    Sanitizer --> Sizing
+    Sizing -->|"status = ERROR"| RejectD(["END<br/>Sizing Error"]):::reject
+    Sizing -->|"status = SIZED"| Approval
+    Approval -->|"resume = 'approved'"| Executor
+    Approval -->|"anything else"| LogStop
+    Executor --> End1(["END (Phase 7: write to Ledger)"])
+    LogStop --> End2(["END"])
+    Executor -.->|"planned"| Ledger
+    Ledger -.->|"planned"| Metrics
 
     Evaluator -.->|"LLM tool-call<br/>model decides"| News[["LangChain tool:<br/>fetch_financial_news"]]:::lctool
     News -.->|"scraped text"| Evaluator
+
+    Sizing ==>|"graph calls directly<br/>LLM never sees this tool"| MC[["MCP quant_tools:<br/>estimate_risk_monte_carlo"]]:::mcp
+    MC ==>|"RiskEstimate"| Sizing
 
     Sizing ==>|"graph calls directly<br/>LLM never sees this tool"| KS[["MCP quant_tools:<br/>compute_position_size"]]:::mcp
     KS ==>|"PositionSizeResult"| Sizing
@@ -58,9 +59,10 @@ flowchart TD
 
 ## Reading this diagram in an interview
 
-- The graph as actually wired in `graph.py` today stops at `xss_sanitizer → END`. Everything from `position_sizing` onward is designed but not connected — that's an honest, visible gap, not a hidden one.
-- `estimate_risk_monte_carlo` is bound to the evaluator's LLM via `.bind_tools()` — the model decides whether and how to call it. That's safe because it's read-only and informational.
-- `compute_position_size` is never bound to the LLM. Only the graph's own deterministic code is meant to call it — this is the structural guardrail from Design Principle 2 in practice, not just a claim.
-- `fetch_financial_news` is a plain LangChain tool, not MCP — worth being precise about the difference if asked, since only `quant_tools` is the actual MCP server this project exposes.
+- The full risk pipeline is now wired end to end: `security → watchdog → rag_evaluator → xss_sanitizer → position_sizing → human_approval → executor_stub / log_and_stop`. All of it is covered by `tests/test_graph_gates.py` (13 tests), which passed 42/42 against the whole suite as of the last run.
+- `position_sizing` calls `estimate_risk_monte_carlo` and `compute_position_size` directly as Python functions — both are also exposed through the `quant_tools` MCP server (`src/mcp/server.py`) so they're independently callable over the MCP protocol, but the graph itself never routes through that protocol layer for its own internal calls. That's a deliberate simplicity choice, not an oversight: MCP exposure and "who's allowed to call it" are separate concerns, and the graph gets a direct, zero-latency call for logic that has to run every time regardless of what any LLM decided.
+- Neither `estimate_risk_monte_carlo` nor `compute_position_size` is bound to the evaluator LLM via `.bind_tools()` right now — only `fetch_financial_news` is. That's worth being precise about if asked: the earlier plan was for Monte Carlo to be LLM-bindable as an informational tool, but as currently wired, the LLM never sees either quant tool. Kelly sizing was never meant to be LLM-bindable at all (Design Principle 2), and that part is correctly enforced — the function isn't in any `bind_tools()` call anywhere in the codebase.
+- `human_approval` genuinely pauses the graph via `interrupt()` and a `MemorySaver` checkpoint — proven, not just claimed, by `test_graph_pauses_at_human_approval_before_executing`, `test_approved_resume_reaches_executor`, and `test_rejected_resume_never_reaches_executor` actually driving a real interrupt/resume cycle.
+- `executor_stub` and the SQLite ledger are still separate: the executor currently just prints a paper-trade line and ends the graph. Phase 7 replaces the stub with a real ledger write — that's the next real gap, and it's an honest, visible one on this diagram, not a hidden one.
 
 *This file (and `docs/architecture.html`, the browser-viewable version) is updated automatically as new pieces get built — no need to ask for a refresh.*

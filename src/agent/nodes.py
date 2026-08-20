@@ -4,30 +4,68 @@ from src.agent.state import MarketSentinelState
 from src.security.guardrails import GuardrailGateway
 from src.tools.watchdog import run_watchdog
 from langchain_core.tools import tool
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from scrapling.fetchers import StealthyFetcher
-
+from langgraph.types import interrupt
+from src.tools.monte_carlo import estimate_risk_monte_carlo
+from src.tools.sizing import compute_position_size, PositionSizeResult
+from src.tools.retrieval import chunk_html, hybrid_rank_chunks
 gatekeeper = GuardrailGateway()
 
+_embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+
+def _embed_text(text: str) -> list[float]:
+    return _embeddings.embed_query(text)
+
+
 @tool
-def fetch_financial_news(urls: list[str]) -> str:
-    """Fetches real-time text from multiple financial news URLs concurrently."""
+def fetch_financial_news(urls: list[str], query: str = "") -> str:
+    """Fetches real-time text from multiple financial news URLs, then chunks
+    and ranks it with hybrid retrieval so only the most relevant material
+    reaches the model -- not just the first 1500 characters of raw markup.
+
+    Ephemeral by design -- chunks and rankings exist only for this single
+    call and are never persisted, since financial news relevance decays
+    within hours (see DECISIONS.md). `query` lets the calling model steer
+    what "relevant" means for this specific evaluation; if omitted, a
+    generic market-moving-news query is used instead.
+    """
     print(f"\n    [Scrapling Tool] Executing production fetch for {len(urls)} URLs...")
-    scraped_results = []
+    all_chunks = []
 
     for url in urls:
         try:
             page = StealthyFetcher.fetch(url)
-            paragraphs = page.css("p::text").getall()
-            clean_text = " ".join(paragraphs)[:1500] if paragraphs else "No readable article text found."
-            scraped_results.append(f"--- SOURCE: {url} ---\n{clean_text}\n")
-            print(f"    [Scrapling Tool] Successfully extracted data from {url}")
+            html_body = page.html_content
+            chunks = chunk_html(html_body, source_url=url) if html_body else []
+            all_chunks.extend(chunks)
+            print(f"    [Scrapling Tool] Extracted {len(chunks)} chunks from {url}")
         except Exception as e:
             print(f"    [Scrapling Tool] Failed to fetch {url}: {str(e)}")
-            scraped_results.append(f"--- SOURCE: {url} ---\nError fetching data: {str(e)}\n")
 
-    return "\n".join(scraped_results)
+    if not all_chunks:
+        return "No readable article text found from any source."
+
+    search_query = query or "financial news, earnings, and market-moving events"
+
+    # Fail-safe, not fail-open: if hybrid ranking breaks for any reason (the
+    # embedding model isn't pulled, Ollama isn't reachable, etc.), fall back
+    # to the raw chunks in scrape order rather than crashing the whole
+    # evaluator node over a ranking failure.
+    try:
+        top_chunks = hybrid_rank_chunks(all_chunks, query=search_query, embed_fn=_embed_text, top_k=8)
+    except Exception as e:
+        print(f"    [Retrieval] Hybrid ranking failed, falling back to unranked chunks: {str(e)}")
+        top_chunks = all_chunks[:8]
+
+    formatted = []
+    for c in top_chunks:
+        heading = f" ({c.heading_context})" if c.heading_context else ""
+        formatted.append(f"--- SOURCE: {c.source_url}{heading} ---\n{c.text}\n")
+
+    return "\n".join(formatted)
 
 
 def security_check(state: MarketSentinelState) -> Dict[str, Any]:
@@ -112,3 +150,66 @@ def sanitize_output(state: MarketSentinelState) -> Dict[str, Any]:
         clean_reasoning = html.escape(state.evaluation_reasoning)
         return {'evaluation_reasoning': clean_reasoning, 'status': 'COMPLETED'}
     return {'status': 'COMPLETED'}
+def position_sizing(state: MarketSentinelState) -> Dict[str, Any]:
+    """Node: deterministic risk estimation + Kelly sizing.
+
+    Calls both quant_tools functions directly -- never through the LLM's
+    tool-calling loop -- so a real position size exists regardless of what the
+    evaluator's model did or didn't decide to call during its own reasoning.
+    """
+    sig = state.technical_signals
+
+    if state.recommended_action != "BUY":
+        return {
+            "position_size": PositionSizeResult(
+                position_pct=0.0, position_dollars=0.0, full_kelly_pct=0.0, capped=False
+            ),
+            "status": "SIZED",
+        }
+
+    try:
+        risk = estimate_risk_monte_carlo(sig.price_history)
+        position = compute_position_size(
+            win_probability=risk.win_probability,
+            expected_return=risk.expected_return,
+            variance=risk.variance,
+            bankroll=state.bankroll,
+        )
+        return {"risk_estimate": risk, "position_size": position, "status": "SIZED"}
+    except ValueError as e:
+        return {"status": "ERROR", "rejection_reason": f"Sizing Error: {str(e)}"}
+
+
+def human_approval(state: MarketSentinelState) -> Dict[str, Any]:
+    """Node: pause and wait for a real human decision.
+
+    interrupt() suspends execution here -- nothing after this node runs until
+    the graph is resumed with Command(resume=...) on the same thread_id. The
+    checkpointer persists state across that pause, including across a process
+    restart, because it's written to storage, not held in memory on the stack.
+    """
+    decision = interrupt(
+        {
+            "ticker": state.ticker,
+            "recommended_action": state.recommended_action,
+            "evaluation_reasoning": state.evaluation_reasoning,
+            "position_size": state.position_size.model_dump() if state.position_size else None,
+        }
+    )
+    return {"approval_decision": decision}
+
+
+def executor_stub(state: MarketSentinelState) -> Dict[str, Any]:
+    """Stub -- Phase 7 replaces this with a real paper-trade write to the SQLite ledger."""
+    pct = state.position_size.position_pct if state.position_size else 0.0
+    dollars = state.position_size.position_dollars if state.position_size else 0.0
+    print(
+        f"[EXECUTOR-STUB] Paper trade recorded: {state.ticker} {state.recommended_action} "
+        f"{pct:.2%} of bankroll (${dollars:,.2f})"
+    )
+    return {"status": "EXECUTED"}
+
+
+def log_and_stop(state: MarketSentinelState) -> Dict[str, Any]:
+    print(f"[LOG] Trade not executed. approval_decision={state.approval_decision!r}")
+    return {"status": "STOPPED"}

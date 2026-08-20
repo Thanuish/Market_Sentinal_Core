@@ -15,6 +15,7 @@ class TechnicalSignals(BaseModel):
     lower_band: float = Field(..., description="Bollinger Lower Band (-2 Std Dev from 20-SMA).")
     volatility_state: str = Field(..., description="High, Low, or Normal based on price relative to bands.")
     volatility_index: float = Field(..., description="30-day annualized volatility.")
+    price_history: list[float] = Field(..., description="Daily close prices used to derive the signals above -- consumed by Monte Carlo risk estimation downstream.")
 
 def _fetch_crypto_data(symbol: str) -> pd.DataFrame:
     """Fetches 1-year equivalent daily klines from Binance Public API."""
@@ -97,7 +98,7 @@ def run_watchdog(ticker: str, asset_type: str = 'stock') -> TechnicalSignals:
     # 7. Annualized Risk (30-day)
     daily_returns = df['Close'].pct_change().dropna()
     volatility = float(daily_returns.tail(30).std() * np.sqrt(252))
-
+    
     return TechnicalSignals(
         ticker=ticker.upper(),
         current_price=round(current_price, 4 if asset_type == 'forex' else 2),
@@ -107,6 +108,6 @@ def run_watchdog(ticker: str, asset_type: str = 'stock') -> TechnicalSignals:
         upper_band=round(upper, 4 if asset_type == 'forex' else 2),
         lower_band=round(lower, 4 if asset_type == 'forex' else 2),
         volatility_state=vol_state,
-        volatility_index=round(volatility, 4)
+        volatility_index=round(volatility, 4),
         price_history=df['Close'].tolist(),
     )
