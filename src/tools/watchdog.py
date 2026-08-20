@@ -108,4 +108,5 @@ def run_watchdog(ticker: str, asset_type: str = 'stock') -> TechnicalSignals:
         lower_band=round(lower, 4 if asset_type == 'forex' else 2),
         volatility_state=vol_state,
         volatility_index=round(volatility, 4)
+        price_history=df['Close'].tolist(),
     )
